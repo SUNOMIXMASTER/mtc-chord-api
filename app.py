@@ -1,3 +1,9 @@
+import collections
+import collections.abc
+collections.MutableSequence = collections.abc.MutableSequence
+collections.MutableMapping = collections.abc.MutableMapping
+collections.Mapping = collections.abc.Mapping
+collections.Callable = collections.abc.Callable
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
