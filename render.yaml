@@ -2,7 +2,7 @@ services:
   - type: web
     name: mtc-chord-api
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install Cython==3.0.10 numpy==1.26.4 && pip install -r requirements.txt
     startCommand: gunicorn app:app --workers 2 --timeout 120
     envVars:
       - key: PYTHON_VERSION
