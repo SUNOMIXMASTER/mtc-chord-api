@@ -1,9 +1,3 @@
-import collections
-import collections.abc
-collections.MutableSequence = collections.abc.MutableSequence
-collections.MutableMapping = collections.abc.MutableMapping
-collections.Mapping = collections.abc.Mapping
-collections.Callable = collections.abc.Callable
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
@@ -12,7 +6,7 @@ import os
 import librosa
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)  # MTC 브라우저에서 호출 허용
 
 # ── 코드 인식 (Madmom CNN) ──
 def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
@@ -26,6 +20,10 @@ def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
         features = featproc(audio_path)
         chords   = recproc(features)
         # chords: [(start, end, label), ...]
+        
+        print(f'[Madmom] 원시 코드 {len(chords)}개 감지')
+        for c in chords[:10]:
+            print(f'  {c[0]:.2f}~{c[1]:.2f}: {c[2]}')
         
         # 마디 그리드로 변환
         beat_sec   = 60.0 / bpm
@@ -42,7 +40,7 @@ def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
                        6:'#iv',7:'v',8:'VI',9:'vi',10:'VII',11:'#VII'}
         
         def chord_label_to_roman(label, key_num, is_minor):
-            if not label or label in ('N', 'X', 'N/A'):
+            if not label or label in ('N', 'X', 'N/A', 'N'):
                 return None
             root_str = label.split(':')[0]
             rn = NOTE_MAP.get(root_str)
@@ -50,6 +48,22 @@ def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
                 return None
             interval = (rn - key_num + 12) % 12
             return (MINOR_ROMAN if is_minor else MAJOR_ROMAN).get(interval)
+
+        def get_dominant_chord_in_range(start, end):
+            """주어진 시간 범위에서 가장 오래 지속된 코드 반환"""
+            best_label = None
+            best_duration = 0
+            for (cs, ce, cl) in chords:
+                if cl in ('N', 'X', 'N/A'): continue
+                # 겹치는 구간 계산
+                overlap_start = max(cs, start)
+                overlap_end = min(ce, end)
+                if overlap_end > overlap_start:
+                    dur = overlap_end - overlap_start
+                    if dur > best_duration:
+                        best_duration = dur
+                        best_label = cl
+            return best_label
         
         results = []
         for bar_idx in range(total_bars):
@@ -57,34 +71,44 @@ def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
             beat_romans = []
             
             for beat in range(4):
-                beat_time = bar_start + beat * beat_sec + beat_sec * 0.5
-                # beat_time에서 활성화된 코드 찾기
-                active_label = None
-                for (cs, ce, cl) in chords:
-                    if cs <= beat_time < ce:
-                        active_label = cl
-                        break
-                roman = chord_label_to_roman(active_label, key_num, is_minor)
+                beat_start = bar_start + beat * beat_sec
+                beat_end = beat_start + beat_sec
+                
+                # 박 구간에서 가장 오래 지속된 코드 찾기
+                dominant_label = get_dominant_chord_in_range(beat_start, beat_end)
+                roman = chord_label_to_roman(dominant_label, key_num, is_minor)
                 beat_romans.append(roman)
             
             valid = [r for r in beat_romans if r]
-            if len(valid) < 2:
+            if len(valid) < 1:
                 continue
-            # null 채우기
+
+            # null 채우기 (앞 박 값으로)
             for b in range(4):
                 if not beat_romans[b]:
-                    beat_romans[b] = beat_romans[b-1] if b > 0 else valid[0]
+                    if b > 0 and beat_romans[b-1]:
+                        beat_romans[b] = beat_romans[b-1]
+                    elif valid:
+                        beat_romans[b] = valid[0]
+
+            # 연속 중복 제거 (i-i-i-i → i)
+            pattern = ' - '.join(beat_romans[:4])
             
             results.append({
                 'time': bar_start,
-                'chord': ' - '.join(beat_romans[:4]),
+                'chord': pattern,
                 'source': 'madmom'
             })
+            
+            if bar_idx < 10:
+                print(f'[Madmom] Bar {bar_idx+1}: {pattern}')
         
         return results
 
     except Exception as e:
+        import traceback
         print(f'[Madmom ERROR] {e}')
+        traceback.print_exc()
         return []
 
 
