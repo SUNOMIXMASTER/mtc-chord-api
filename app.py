@@ -19,11 +19,9 @@ from madmom.features.chords import CNNChordFeatureProcessor, CRFChordRecognition
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 전역 프로세서 (한 번만 로드)
 _featproc = CNNChordFeatureProcessor()
 _recproc  = CRFChordRecognitionProcessor()
 
-# ── 코드 인식 (Madmom CNN) ──
 def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
     try:
         features = _featproc(audio_path)
@@ -94,11 +92,7 @@ def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
                         beat_romans[b] = valid[0]
 
             pattern = ' - '.join(beat_romans[:4])
-            results.append({
-                'time': bar_start,
-                'chord': pattern,
-                'source': 'madmom'
-            })
+            results.append({'time': bar_start, 'chord': pattern, 'source': 'madmom'})
 
             if bar_idx < 10:
                 print(f'[Madmom] Bar {bar_idx+1}: {pattern}')
@@ -112,7 +106,6 @@ def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
         return []
 
 
-# ── 폴백: librosa ──
 def analyze_chords_librosa(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
@@ -183,6 +176,8 @@ def analyze():
     key_num  = int(request.form.get('keyNum', 0))
     is_minor = request.form.get('isMinor', 'false').lower() == 'true'
     grid_offset = float(request.form.get('gridOffset', 0.0))
+
+    print(f'[파라미터] bpm={bpm}, keyNum={key_num}, isMinor={is_minor}, gridOffset={grid_offset}')
 
     suffix = os.path.splitext(f.filename)[1] or '.wav'
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
