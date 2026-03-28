@@ -6,7 +6,7 @@ import os
 import librosa
 
 app = Flask(__name__)
-CORS(app)  # MTC 브라우저에서 호출 허용
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ── 코드 인식 (Madmom CNN) ──
 def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0):
