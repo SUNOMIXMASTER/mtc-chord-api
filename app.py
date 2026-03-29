@@ -113,37 +113,40 @@ Roman numeral reference for key {key_name}:
 - Major keys use uppercase: I, II, III, IV, V, VI, VII
 - Accidentals allowed: bII, #IV, bVI, bVII etc."""
 
-    try:
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}'
-        payload = {
-            'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {
-                'temperature': 0.1,
-                'maxOutputTokens': 8192
-            }
-        }
-        resp = requests.post(url, json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        text = data['candidates'][0]['content']['parts'][0]['text'].strip()
-
-        # JSON 파싱 (마크다운 코드블록 제거)
-        if '```' in text:
-            text = text.split('```')[1]
-            if text.startswith('json'):
-                text = text[4:]
-        text = text.strip()
-
-        parsed = json.loads(text)
-        bars = parsed['bars']
-        print(f'[Gemini] {len(bars)}개 마디 반환')
-        for b in bars[:10]:
-            print(f'  Bar {b["bar"]}: {b["beat1"]} - {b["beat2"]} - {b["beat3"]} - {b["beat4"]}')
-        return bars
-
-    except Exception as e:
-        print(f'[Gemini ERROR] {e}')
-        return None
+    import time
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}'
+    payload = {
+        'contents': [{'parts': [{'text': prompt}]}],
+        'generationConfig': {'temperature': 0.1, 'maxOutputTokens': 8192}
+    }
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                wait = attempt * 10
+                print(f'[Gemini] {wait}초 대기 후 재시도 ({attempt+1}/3)')
+                time.sleep(wait)
+            resp = requests.post(url, json=payload, timeout=60)
+            if resp.status_code == 429:
+                print(f'[Gemini] 429 Too Many Requests - 재시도 대기')
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            text = data['candidates'][0]['content']['parts'][0]['text'].strip()
+            if '```' in text:
+                text = text.split('```')[1]
+                if text.startswith('json'):
+                    text = text[4:]
+            text = text.strip()
+            parsed = json.loads(text)
+            bars = parsed['bars']
+            print(f'[Gemini] {len(bars)}개 마디 반환')
+            for b in bars[:10]:
+                print(f'  Bar {b["bar"]}: {b["beat1"]} - {b["beat2"]} - {b["beat3"]} - {b["beat4"]}')
+            return bars
+        except Exception as e:
+            print(f'[Gemini ERROR] attempt {attempt+1}: {e}')
+    print('[Gemini] 3회 시도 모두 실패')
+    return None
 
 
 def analyze_chords_madmom(audio_path, bpm, key_num, is_minor, grid_offset=0.0, chunk_offset=0.0):
