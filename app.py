@@ -20,9 +20,12 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 _featproc = CNNChordFeatureProcessor()
 _recproc  = CRFChordRecognitionProcessor()
 
+GEMINI_API_KEY_ENV = os.environ.get('GEMINI_API_KEY', '')
+
 @app.route('/ping', methods=['GET'])
 def ping():
-    return jsonify({'status': 'ok'})
+    # 프론트가 Gemini를 직접 호출할 수 있도록 키 전달
+    return jsonify({'status': 'ok', 'geminiKey': GEMINI_API_KEY_ENV})
 
 
 @app.route('/analyze', methods=['POST'])
