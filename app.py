@@ -122,7 +122,7 @@ Roman numeral reference for key {key_name}:
     for attempt in range(3):
         try:
             if attempt > 0:
-                wait = attempt * 10
+                wait = attempt * 3
                 print(f'[Gemini] {wait}초 대기 후 재시도 ({attempt+1}/3)')
                 time.sleep(wait)
             resp = requests.post(url, json=payload, timeout=60)
