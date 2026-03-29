@@ -168,52 +168,21 @@ def analyze():
         for c in chords[:10]:
             print(f'  {c[0]:.2f}~{c[1]:.2f}: {c[2]}')
 
-        # Gemini 그리드 매핑
-        gemini_bars = gemini_grid_mapping(chords, bpm, key_num, is_minor, grid_offset, chunk_offset)
-
-        if gemini_bars:
-            results = []
-            for bar in gemini_bars:
-                pattern = f"{bar['beat1']} - {bar['beat2']} - {bar['beat3']} - {bar['beat4']}"
-                results.append({
-                    'time': bar['time'],
-                    'chord': pattern,
-                    'source': 'gemini'
-                })
-            return jsonify({'chords': results, 'engine': 'gemini'})
-
-        # Gemini 실패시 폴백
-        print('[Gemini 실패] 폴백 처리')
-        beat_sec = 60.0 / bpm
-        bar_sec = beat_sec * 4
-        duration = librosa.get_duration(path=tmp_path)
-        total_bars = int(np.ceil((duration - grid_offset) / bar_sec))
-
-        results = []
-        for bar_idx in range(total_bars):
-            bar_start = grid_offset + bar_idx * bar_sec
-            beat_romans = []
-            for beat in range(4):
-                beat_start = bar_start + beat * beat_sec
-                beat_end = beat_start + beat_sec
-                best_label = None
-                best_dur = 0
-                for (cs, ce, cl) in chords:
-                    if cl in ('N', 'X', 'N/A'): continue
-                    overlap = min(ce, beat_end) - max(cs + chunk_offset, beat_start)
-                    if overlap > best_dur:
-                        best_dur = overlap
-                        best_label = cl
-                roman = chord_to_roman(best_label, key_num, is_minor)
-                beat_romans.append(roman)
-            valid = [r for r in beat_romans if r]
-            if len(valid) < 1: continue
-            for b in range(4):
-                if not beat_romans[b]:
-                    beat_romans[b] = beat_romans[b-1] if b > 0 else valid[0]
-            results.append({'time': bar_start, 'chord': ' - '.join(beat_romans[:4]), 'source': 'madmom'})
-
-        return jsonify({'chords': results, 'engine': 'madmom'})
+        # raw 데이터 반환 (index.html이 Gemini 호출)
+        raw = []
+        for (cs, ce, cl) in chords:
+            raw.append({
+                'start': round(float(chunk_offset + cs), 3),
+                'end':   round(float(chunk_offset + ce), 3),
+                'label': cl
+            })
+        return jsonify({
+            'raw': raw,
+            'bpm': bpm,
+            'keyNum': key_num,
+            'isMinor': is_minor,
+            'gridOffset': grid_offset
+        })
 
     finally:
         os.unlink(tmp_path)
