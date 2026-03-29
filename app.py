@@ -22,9 +22,23 @@ _recproc  = CRFChordRecognitionProcessor()
 
 GEMINI_API_KEY_ENV = os.environ.get('GEMINI_API_KEY', '')
 
+
+def compress_chords(raw):
+    """연속된 동일 코드 병합 + 소수점 3자리 정리"""
+    if not raw:
+        return []
+    compressed = [raw[0].copy()]
+    for item in raw[1:]:
+        if item['label'] == compressed[-1]['label']:
+            # 같은 코드면 끝 시간만 연장
+            compressed[-1]['end'] = item['end']
+        else:
+            compressed.append(item.copy())
+    return compressed
+
+
 @app.route('/ping', methods=['GET'])
 def ping():
-    # 프론트가 Gemini를 직접 호출할 수 있도록 키 전달
     return jsonify({'status': 'ok', 'geminiKey': GEMINI_API_KEY_ENV})
 
 
@@ -50,7 +64,7 @@ def analyze():
         silence_count = sum(1 for c in chords if c[2] in ('N', 'X', 'N/A'))
         print(f'[Madmom] {len(chords)}개 감지 (코드={len(chords)-silence_count}, N/침묵={silence_count})')
 
-        # N/Silence 포함 전체 raw 반환 (프론트에서 모아서 Gemini 호출)
+        # 원시 raw 생성
         raw = []
         for (cs, ce, cl) in chords:
             raw.append({
@@ -59,8 +73,10 @@ def analyze():
                 'label': cl
             })
 
-        print(f'[청크 완료] raw {len(raw)}개 반환')
-        return jsonify({'raw': raw, 'engine': 'madmom'})
+        # 연속 동일 코드 압축
+        compressed = compress_chords(raw)
+        print(f'[청크 완료] raw {len(raw)}개 → 압축 {len(compressed)}개 반환')
+        return jsonify({'raw': compressed, 'engine': 'madmom'})
 
     finally:
         os.unlink(tmp_path)
