@@ -25,7 +25,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 _featproc = CNNChordFeatureProcessor()
 _recproc  = CRFChordRecognitionProcessor()
 
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_API_KEY_ENV = os.environ.get('GEMINI_API_KEY', '')
 
 NOTE_MAP = {'C':0,'C#':1,'Db':1,'D':2,'D#':3,'Eb':3,'E':4,'F':5,
             'F#':6,'Gb':6,'G':7,'G#':8,'Ab':8,'A':9,'A#':10,'Bb':10,'B':11}
@@ -42,8 +42,8 @@ def chord_to_roman(label, key_num, is_minor):
     interval = (rn - key_num + 12) % 12
     return (MINOR_ROMAN if is_minor else MAJOR_ROMAN).get(interval)
 
-def gemini_grid_mapping(raw_chords, bpm, key_num, is_minor, grid_offset, chunk_offset):
-    if not GEMINI_API_KEY:
+def gemini_grid_mapping(raw_chords, bpm, key_num, is_minor, grid_offset, chunk_offset, api_key):
+    if not api_key:
         print('[Gemini] API 키 없음')
         return None
 
@@ -52,22 +52,22 @@ def gemini_grid_mapping(raw_chords, bpm, key_num, is_minor, grid_offset, chunk_o
     beat_sec = 60.0 / bpm
     bar_sec = beat_sec * 4
 
+    # N/X 포함 전체 데이터 전달
     raw_lines = []
     for (cs, ce, cl) in raw_chords:
-        if cl in ('N', 'X', 'N/A'):
-            continue
-        roman = chord_to_roman(cl, key_num, is_minor)
+        roman = chord_to_roman(cl, key_num, is_minor) if cl not in ('N', 'X', 'N/A') else 'Silence'
         abs_start = chunk_offset + cs
         abs_end = chunk_offset + ce
         duration = ce - cs
-        raw_lines.append(f'  {abs_start:.3f}s ~ {abs_end:.3f}s | {cl} -> {roman} | duration: {duration:.3f}s')
+        raw_lines.append(f'  {abs_start:.3f}s ~ {abs_end:.3f}s | {cl} ({roman}) | {duration:.3f}s')
 
     raw_text = '\n'.join(raw_lines)
 
     prompt = (
-        'You are an expert music analyst for DJ mixing and electronic dance music.\n'
-        'Analyze chord data from Madmom CNN and map it onto a musical bar grid like a DAW chord track.\n\n'
-        'RAW CHORD DATA:\n' + raw_text + '\n\n'
+        'You are an expert music analyst AND experienced DJ specializing in electronic dance music.\n'
+        'Your job: analyze Madmom chord data and map it onto a precise bar grid like a Logic Pro chord track.\n\n'
+        'RAW CHORD DATA (including silence/N regions for timing reference):\n'
+        + raw_text + '\n\n'
         'SONG PARAMETERS:\n'
         f'- BPM: {bpm}\n'
         f'- Key: {key_name}\n'
@@ -75,18 +75,24 @@ def gemini_grid_mapping(raw_chords, bpm, key_num, is_minor, grid_offset, chunk_o
         f'- Bar duration: {bar_sec:.4f}s\n'
         f'- Beat duration: {beat_sec:.4f}s\n'
         f'- Chunk starts at: {chunk_offset:.2f}s\n\n'
-        'TASK:\n'
-        '1. Calculate bar boundaries using BPM and grid offset.\n'
-        '2. For each bar, assign chords to 4 beats based on actual timestamps.\n'
-        '3. If chord spans whole bar: repeat in all 4 beats.\n'
-        '4. If 2 chords per bar: beats 1-2 first chord, beats 3-4 second chord.\n'
-        f'5. Use roman numerals relative to key {key_name}.\n'
-        '6. Ignore chord fragments under 0.2 seconds.\n\n'
-        'OUTPUT: JSON only, no explanation.\n'
+        'STRICT RULES:\n'
+        '1. Calculate EXACT bar boundaries using BPM and grid offset.\n'
+        '2. For each bar, check which chords fall within it by timestamp.\n'
+        '3. Musical judgment per bar:\n'
+        '   - Same chord whole bar: repeat in all 4 beats\n'
+        '   - 2 chords per bar: first chord beats 1-2, second beats 3-4\n'
+        '   - Different each beat: assign individually\n'
+        f'4. MANDATORY: Every single bar MUST have all 4 beats filled. NO empty beats allowed.\n'
+        '5. For bars with N/Silence/missing data: USE YOUR DJ INTUITION to infer the most\n'
+        '   musically logical chord based on surrounding bars and common chord progressions.\n'
+        '   Do NOT leave any beat empty or null.\n'
+        f'6. Use roman numerals relative to key {key_name} only.\n'
+        '7. Ignore chord fragments under 0.2 seconds (noise).\n\n'
+        'OUTPUT: Return ONLY valid JSON. No explanation, no markdown.\n'
         '{"bars": [{"bar": 1, "time": 0.000, "beat1": "i", "beat2": "i", "beat3": "III", "beat4": "III"}]}'
     )
 
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}'
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}'
     payload = {
         'contents': [{'parts': [{'text': prompt}]}],
         'generationConfig': {'temperature': 0.1, 'maxOutputTokens': 8192}
@@ -140,7 +146,11 @@ def analyze():
     grid_offset  = float(request.form.get('gridOffset', 0.0))
     chunk_offset = float(request.form.get('chunkOffset', 0.0))
 
+    # 요청에서 온 키 우선, 없으면 환경변수
+    api_key = request.form.get('geminiApiKey', '').strip() or GEMINI_API_KEY_ENV
+
     print(f'[파라미터] bpm={bpm}, keyNum={key_num}, isMinor={is_minor}, gridOffset={grid_offset}, chunkOffset={chunk_offset}')
+    print(f'[Gemini 키] {"요청에서" if request.form.get("geminiApiKey") else "환경변수에서"} 로드')
 
     suffix = os.path.splitext(f.filename)[1] or '.wav'
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -156,7 +166,7 @@ def analyze():
             print(f'  {c[0]:.2f}~{c[1]:.2f}: {c[2]}')
 
         # Gemini 호출
-        gemini_bars = gemini_grid_mapping(chords, bpm, key_num, is_minor, grid_offset, chunk_offset)
+        gemini_bars = gemini_grid_mapping(chords, bpm, key_num, is_minor, grid_offset, chunk_offset, api_key)
 
         if gemini_bars:
             results = []
