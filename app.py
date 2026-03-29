@@ -64,34 +64,27 @@ def gemini_grid_mapping(raw_chords, bpm, key_num, is_minor, grid_offset, chunk_o
 
     raw_text = '\n'.join(raw_lines)
 
-    prompt = f"""You are an expert music analyst for DJ mixing and electronic dance music.
-Analyze chord data from Madmom CNN and map it onto a musical bar grid like a DAW chord track.
-
-RAW CHORD DATA:
-{raw_text}
-
-SONG PARAMETERS:
-- BPM: {bpm}
-- Key: {key_name}
-- Grid offset (beat 1 position): {grid_offset:.4f}s
-- Bar duration: {bar_sec:.4f}s
-- Beat duration: {beat_sec:.4f}s
-- Chunk starts at: {chunk_offset:.2f}s
-
-TASK:
-1. Calculate bar boundaries using BPM and grid offset.
-2. For each bar, assign chords to 4 beats based on actual timestamps.
-3. If chord spans whole bar: repeat in all 4 beats.
-4. If 2 chords per bar: beats 1-2 first chord, beats 3-4 second chord.
-5. Use roman numerals relative to key {key_name}.
-6. Ignore chord fragments under 0.2 seconds.
-
-OUTPUT: JSON only, no explanation.
-{{"bars": [{{"bar": 1, "time": 0.000, "beat1": "i", "beat2": "i", "beat3": "III", "beat4": "III"}}]}}
-
-Roman numerals for {key_name}:
-- Minor: i ii III iv v VI VII
-- Major: I ii iii IV V vi vii"""
+    prompt = (
+        'You are an expert music analyst for DJ mixing and electronic dance music.\n'
+        'Analyze chord data from Madmom CNN and map it onto a musical bar grid like a DAW chord track.\n\n'
+        'RAW CHORD DATA:\n' + raw_text + '\n\n'
+        'SONG PARAMETERS:\n'
+        f'- BPM: {bpm}\n'
+        f'- Key: {key_name}\n'
+        f'- Grid offset (beat 1 position): {grid_offset:.4f}s\n'
+        f'- Bar duration: {bar_sec:.4f}s\n'
+        f'- Beat duration: {beat_sec:.4f}s\n'
+        f'- Chunk starts at: {chunk_offset:.2f}s\n\n'
+        'TASK:\n'
+        '1. Calculate bar boundaries using BPM and grid offset.\n'
+        '2. For each bar, assign chords to 4 beats based on actual timestamps.\n'
+        '3. If chord spans whole bar: repeat in all 4 beats.\n'
+        '4. If 2 chords per bar: beats 1-2 first chord, beats 3-4 second chord.\n'
+        f'5. Use roman numerals relative to key {key_name}.\n'
+        '6. Ignore chord fragments under 0.2 seconds.\n\n'
+        'OUTPUT: JSON only, no explanation.\n'
+        '{"bars": [{"bar": 1, "time": 0.000, "beat1": "i", "beat2": "i", "beat3": "III", "beat4": "III"}]}'
+    )
 
     url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}'
     payload = {
@@ -105,30 +98,24 @@ Roman numerals for {key_name}:
                 wait = attempt * 15
                 print(f'[Gemini] {wait}초 대기 후 재시도 ({attempt+1}/3)')
                 time.sleep(wait)
-
             resp = requests.post(url, json=payload, timeout=60)
-
             if resp.status_code == 429:
                 print('[Gemini] 429 Too Many Requests')
                 continue
-
             resp.raise_for_status()
             data = resp.json()
             text = data['candidates'][0]['content']['parts'][0]['text'].strip()
-
             if '```' in text:
                 text = text.split('```')[1]
                 if text.startswith('json'):
                     text = text[4:]
             text = text.strip()
-
             parsed = json.loads(text)
             bars = parsed['bars']
             print(f'[Gemini] {len(bars)}개 마디 반환')
             for b in bars[:5]:
                 print(f'  Bar {b["bar"]}: {b["beat1"]} - {b["beat2"]} - {b["beat3"]} - {b["beat4"]}')
             return bars
-
         except Exception as e:
             print(f'[Gemini ERROR] attempt {attempt+1}: {e}')
 
@@ -168,21 +155,52 @@ def analyze():
         for c in chords[:10]:
             print(f'  {c[0]:.2f}~{c[1]:.2f}: {c[2]}')
 
-        # raw 데이터 반환 (index.html이 Gemini 호출)
-        raw = []
-        for (cs, ce, cl) in chords:
-            raw.append({
-                'start': round(float(chunk_offset + cs), 3),
-                'end':   round(float(chunk_offset + ce), 3),
-                'label': cl
-            })
-        return jsonify({
-            'raw': raw,
-            'bpm': bpm,
-            'keyNum': key_num,
-            'isMinor': is_minor,
-            'gridOffset': grid_offset
-        })
+        # Gemini 호출
+        gemini_bars = gemini_grid_mapping(chords, bpm, key_num, is_minor, grid_offset, chunk_offset)
+
+        if gemini_bars:
+            results = []
+            for bar in gemini_bars:
+                pattern = f"{bar['beat1']} - {bar['beat2']} - {bar['beat3']} - {bar['beat4']}"
+                results.append({
+                    'time': bar['time'],
+                    'chord': pattern,
+                    'source': 'gemini'
+                })
+            return jsonify({'chords': results, 'engine': 'gemini'})
+
+        # Gemini 실패시 폴백
+        print('[Gemini 실패] 폴백')
+        beat_sec = 60.0 / bpm
+        bar_sec = beat_sec * 4
+        duration = librosa.get_duration(path=tmp_path)
+        total_bars = int(np.ceil((duration - grid_offset) / bar_sec))
+
+        results = []
+        for bar_idx in range(total_bars):
+            bar_start = grid_offset + bar_idx * bar_sec
+            beat_romans = []
+            for beat in range(4):
+                beat_start = bar_start + beat * beat_sec
+                beat_end = beat_start + beat_sec
+                best_label = None
+                best_dur = 0
+                for (cs, ce, cl) in chords:
+                    if cl in ('N', 'X', 'N/A'): continue
+                    overlap = min(chunk_offset + ce, beat_end) - max(chunk_offset + cs, beat_start)
+                    if overlap > best_dur:
+                        best_dur = overlap
+                        best_label = cl
+                roman = chord_to_roman(best_label, key_num, is_minor)
+                beat_romans.append(roman)
+            valid = [r for r in beat_romans if r]
+            if len(valid) < 1: continue
+            for b in range(4):
+                if not beat_romans[b]:
+                    beat_romans[b] = beat_romans[b-1] if b > 0 else valid[0]
+            results.append({'time': bar_start, 'chord': ' - '.join(beat_romans[:4]), 'source': 'madmom'})
+
+        return jsonify({'chords': results, 'engine': 'madmom'})
 
     finally:
         os.unlink(tmp_path)
