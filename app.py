@@ -13,24 +13,49 @@ import tempfile
 import os
 import numpy as np
 import librosa
-import soundfile as sf
-import madmom
-from madmom.features.chords import CNNChordFeatureProcessor, CRFChordRecognitionProcessor
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch
+import yaml
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Madmom 프로세서 (서버 시작 시 1회만 로드)
-_featproc = CNNChordFeatureProcessor()
-_recproc  = CRFChordRecognitionProcessor()
+# ── BTC 엔진 로드 (서버 시작 시 1회) ──
+BTC_MODEL    = None
+BTC_DEVICE   = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-CHUNK_SEC = 30  # 청크 길이 (초)
-MAX_WORKERS = 4  # 병렬 처리 워커 수
+# majmin 코드 레이블 (N + 12 maj + 12 min = 25)
+ROOTS        = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+CHORD_LABELS = ['N'] + [r+':maj' for r in ROOTS] + [r+':min' for r in ROOTS]
 
+
+def load_btc_engine():
+    global BTC_MODEL
+    try:
+        base            = os.path.dirname(os.path.abspath(__file__))
+        config_path     = os.path.join(base, 'btc', 'run_config.yaml')
+        checkpoint_path = os.path.join(base, 'btc', 'models', 'BTC-SL', 'checkpoint.pth')
+
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+
+        from btc.btc_model import BTC
+        BTC_MODEL = BTC(config=config['model'])
+        ckpt = torch.load(checkpoint_path, map_location=BTC_DEVICE)
+        BTC_MODEL.load_state_dict(ckpt['model'])
+        BTC_MODEL.to(BTC_DEVICE)
+        BTC_MODEL.eval()
+        print(f'[BTC 엔진] 로드 완료 → {BTC_DEVICE}')
+    except Exception as e:
+        print(f'[BTC 엔진] 로드 실패: {e}')
+        BTC_MODEL = None
+
+load_btc_engine()
+
+
+# ── 유틸 ──
 
 def compress_chords(chords):
-    """연속된 동일 코드 병합"""
+    """연속 동일 코드 병합"""
     if not chords:
         return []
     result = [chords[0].copy()]
@@ -43,7 +68,7 @@ def compress_chords(chords):
 
 
 def apply_grid_cut(audio, sr, bpm, grid_offset_sec, cut_ratio=0.12):
-    """박자 끝 12% 묵음 처리 → 퀀타이즈 효과"""
+    """박자 끝 12% 묵음 → 퀀타이즈 효과"""
     beat_sec      = 60.0 / bpm
     cut_samples   = int(beat_sec * cut_ratio * sr)
     audio         = audio.copy()
@@ -60,22 +85,100 @@ def apply_grid_cut(audio, sr, bpm, grid_offset_sec, cut_ratio=0.12):
     return audio
 
 
+def run_btc_engine(audio, sr):
+    """
+    BTC 엔진 코드 분석
+    - 입력: 22050Hz, CQT (24 bins/octave, hop 512)
+    - 10초 윈도우, 5초 오버랩 슬라이딩
+    - 반환: [(start_sec, end_sec, label), ...]
+    """
+    if BTC_MODEL is None:
+        raise RuntimeError('BTC 엔진 사용 불가')
+
+    TARGET_SR    = 22050
+    HOP_LENGTH   = 512
+    N_BINS       = 144   # 24 bins/octave × 6 octaves
+    BINS_OCTAVE  = 24
+    WINDOW_SEC   = 10.0
+    OVERLAP_SEC  = 5.0
+
+    # 22050Hz로 리샘플
+    if sr != TARGET_SR:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SR)
+        sr = TARGET_SR
+
+    # CQT 추출
+    cqt = np.abs(librosa.cqt(
+        audio, sr=sr, hop_length=HOP_LENGTH,
+        n_bins=N_BINS, bins_per_octave=BINS_OCTAVE
+    ))
+    cqt = librosa.amplitude_to_db(cqt, ref=np.max)
+    cqt = (cqt - cqt.mean()) / (cqt.std() + 1e-8)
+
+    fps           = sr / HOP_LENGTH          # ≈ 43.07 프레임/초
+    win_frames    = int(WINDOW_SEC * fps)
+    step_frames   = int((WINDOW_SEC - OVERLAP_SEC) * fps)
+    total_frames  = cqt.shape[1]
+
+    all_probs = np.zeros((total_frames, len(CHORD_LABELS)))
+    count     = np.zeros(total_frames)
+
+    start = 0
+    while start < total_frames:
+        end   = min(start + win_frames, total_frames)
+        chunk = cqt[:, start:end]
+
+        # 부족한 부분 패딩
+        if chunk.shape[1] < win_frames:
+            pad   = np.zeros((N_BINS, win_frames - chunk.shape[1]))
+            chunk = np.concatenate([chunk, pad], axis=1)
+
+        x = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).to(BTC_DEVICE)
+
+        with torch.no_grad():
+            logits = BTC_MODEL(x)
+            probs  = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+
+        valid = end - start
+        all_probs[start:start+valid] += probs[:valid]
+        count[start:start+valid]     += 1
+
+        if end >= total_frames:
+            break
+        start += step_frames
+
+    # 평균 → 코드 결정
+    avg_probs = all_probs / np.maximum(count[:, None], 1)
+    chord_seq = [CHORD_LABELS[i] for i in np.argmax(avg_probs, axis=1)]
+
+    # 연속 동일 코드 병합 → (start_sec, end_sec, label)
+    results     = []
+    prev        = chord_seq[0]
+    start_frame = 0
+    for i, c in enumerate(chord_seq[1:], 1):
+        if c != prev:
+            results.append((start_frame / fps, i / fps, prev))
+            prev        = c
+            start_frame = i
+    results.append((start_frame / fps, len(chord_seq) / fps, prev))
+
+    return results
+
+
 def snap_to_grid(chords, bpm, grid_offset_sec):
-    """Madmom 결과(초)를 0.5박 단위 그리드에 스냅"""
+    """코드(초)를 0.5박 단위 차체(그리드)에 안착"""
     beat_sec      = 60.0 / bpm
     half_beat_sec = beat_sec / 2.0
     bar_sec       = beat_sec * 4
     result        = []
 
     for (cs, ce, cl) in chords:
-        rel_s = cs - grid_offset_sec
-        rel_e = ce - grid_offset_sec
-
+        rel_s     = cs - grid_offset_sec
+        rel_e     = ce - grid_offset_sec
         snapped_s = round(rel_s / half_beat_sec) * half_beat_sec
         snapped_e = round(rel_e / half_beat_sec) * half_beat_sec
-
-        bar  = int(snapped_s / bar_sec) + 1
-        beat = round(((snapped_s % bar_sec) / beat_sec + 1) * 2) / 2
+        bar       = int(snapped_s / bar_sec) + 1
+        beat      = round(((snapped_s % bar_sec) / beat_sec + 1) * 2) / 2
 
         result.append({
             'start': round(grid_offset_sec + snapped_s, 3),
@@ -88,29 +191,14 @@ def snap_to_grid(chords, bpm, grid_offset_sec):
     return result
 
 
-def analyze_chunk(chunk_audio, sr, chunk_start_sec):
-    """단일 청크 Madmom 분석 (병렬 처리용)"""
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
-            sf.write(tmp.name, chunk_audio, sr)
-            tmp_path = tmp.name
-
-        features = _featproc(tmp_path)
-        chords   = _recproc(features)
-
-        # 청크 시작 시간 오프셋 적용
-        return [(cs + chunk_start_sec, ce + chunk_start_sec, cl) for (cs, ce, cl) in chords]
-
-    finally:
-        if tmp_path:
-            try: os.unlink(tmp_path)
-            except: pass
-
+# ── 엔드포인트 ──
 
 @app.route('/ping', methods=['GET'])
 def ping():
-    return jsonify({'status': 'ok'})
+    return jsonify({
+        'status': 'ok',
+        'engine': 'BTC' if BTC_MODEL else 'unavailable'
+    })
 
 
 @app.route('/analyze_grid', methods=['POST'])
@@ -118,9 +206,9 @@ def analyze_grid():
     """
     파이프라인:
     1. 오디오 + BPM + gridOffset 수신
-    2. 박자 끝 12% 묵음 처리 (퀀타이즈)
-    3. 청크 분할 → 병렬 Madmom 분석
-    4. 결과 병합 + 그리드 스냅 → 반환
+    2. 박자 끝 12% 묵음 (퀀타이즈)
+    3. BTC 엔진 분석
+    4. 차체(그리드) 안착 → 반환
     """
     if 'audio' not in request.files:
         return jsonify({'error': 'audio file required'}), 400
@@ -139,53 +227,20 @@ def analyze_grid():
             f.save(tmp.name)
             tmp_path = tmp.name
 
-        # 오디오 로드 (44100Hz 고정 - Madmom 요구사항)
-        audio, sr = librosa.load(tmp_path, sr=44100, mono=True)
-        total_sec = len(audio) / sr
-        print(f'[오디오] sr={sr}, 길이={total_sec:.1f}초')
+        audio, sr = librosa.load(tmp_path, sr=None, mono=True)
+        print(f'[오디오] sr={sr}, 길이={len(audio)/sr:.1f}초')
 
-        # 박자 끝 12% 묵음 처리
+        # 퀀타이즈
         audio = apply_grid_cut(audio, sr, bpm, grid_offset_sec)
 
-        # 청크 분할
-        chunk_samples = int(CHUNK_SEC * sr)
-        chunks = []
-        start = 0
-        while start < len(audio):
-            end = min(start + chunk_samples, len(audio))
-            chunks.append((audio[start:end], start / sr))
-            start = end
+        # BTC 엔진
+        raw_chords = run_btc_engine(audio, sr)
+        print(f'[BTC] {len(raw_chords)}개 감지')
 
-        print(f'[청크] {len(chunks)}개 청크 병렬 분석 시작')
-
-        # 병렬 Madmom 분석
-        all_chords = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(analyze_chunk, chunk_audio, sr, chunk_start): i
-                for i, (chunk_audio, chunk_start) in enumerate(chunks)
-            }
-            results = {}
-            for future in as_completed(futures):
-                i = futures[future]
-                try:
-                    results[i] = future.result()
-                except Exception as e:
-                    print(f'[청크{i}] 실패: {e}')
-                    results[i] = []
-
-        # 순서대로 병합
-        for i in sorted(results.keys()):
-            all_chords.extend(results[i])
-
-        # 시간순 정렬
-        all_chords.sort(key=lambda x: x[0])
-        print(f'[병합] 총 {len(all_chords)}개 코드')
-
-        # 그리드 스냅
-        snapped    = snap_to_grid(all_chords, bpm, grid_offset_sec)
-        raw        = [{'start': s['start'], 'end': s['end'], 'label': s['label']} for s in snapped]
-        compressed = compress_chords(raw)
+        # 차체 안착
+        snapped    = snap_to_grid(raw_chords, bpm, grid_offset_sec)
+        flat       = [{'start': s['start'], 'end': s['end'], 'label': s['label']} for s in snapped]
+        compressed = compress_chords(flat)
 
         # 마디/박자 재계산
         beat_sec = 60.0 / bpm
