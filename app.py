@@ -11,7 +11,7 @@ from flask_cors import CORS
 import tempfile, os, numpy as np, librosa
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
 # ── 코드 템플릿 (경량 엔진) ──
 CHORD_TEMPLATES = {}
