@@ -15,7 +15,7 @@ CORS(app)
 
 # chord_recognition.py가 있는 폴더를 경로에 추가
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHORD_DIR = os.path.join(BASE_DIR, 'chord_model')
+CHORD_DIR = BASE_DIR
 sys.path.insert(0, CHORD_DIR)
 
 def compress_chords(chords):
