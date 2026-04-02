@@ -6,3 +6,4 @@ librosa
 tensorflow
 numpy
 scipy
+gunicorn
