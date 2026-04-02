@@ -1,5 +1,4 @@
-import collections
-import collections.abc
+import collections, collections.abc
 collections.MutableSequence = collections.abc.MutableSequence
 collections.MutableMapping  = collections.abc.MutableMapping
 collections.Mapping         = collections.abc.Mapping
@@ -14,28 +13,23 @@ import tempfile, os, numpy as np, librosa
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ── CREMA 엔진 로드 (서버 시작 시 1회) ──
-CREMA_MODEL = None
+# ── 코드 템플릿 (경량 엔진) ──
+CHORD_TEMPLATES = {}
+roots = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+maj_intervals = [0,4,7]
+min_intervals = [0,3,7]
 
-def load_crema():
-    global CREMA_MODEL
-    try:
-        from crema.analyze import analyze as crema_analyze
-        CREMA_MODEL = crema_analyze
-        print('[CREMA 엔진] 로드 완료')
-    except Exception as e:
-        print(f'[CREMA 엔진] 로드 실패: {e}')
-        CREMA_MODEL = None
+for i, root in enumerate(roots):
+    maj = np.zeros(12); [maj.__setitem__((i+x)%12, 1) for x in maj_intervals]
+    min_ = np.zeros(12); [min_.__setitem__((i+x)%12, 1) for x in min_intervals]
+    CHORD_TEMPLATES[root] = maj / np.linalg.norm(maj)
+    CHORD_TEMPLATES[f'{root}m'] = min_ / np.linalg.norm(min_)
 
-load_crema()
+CHORD_TEMPLATES['N'] = np.zeros(12)
 
-
-# ── 유틸 ──
 
 def compress_chords(chords):
-    """연속 동일 코드 병합"""
-    if not chords:
-        return []
+    if not chords: return []
     result = [chords[0].copy()]
     for item in chords[1:]:
         if item['label'] == result[-1]['label']:
@@ -45,11 +39,9 @@ def compress_chords(chords):
     return result
 
 
-def smooth_chords(chords, min_duration=0.3):
-    """짧은 코드 제거 + 연속 동일 코드 병합 (Logic 스타일)"""
+def smooth_chords(chords, min_duration=0.5):
     filtered = [c for c in chords if (c['end'] - c['start']) >= min_duration]
-    if not filtered:
-        return chords
+    if not filtered: return chords
     merged = [filtered[0].copy()]
     for c in filtered[1:]:
         if c['label'] == merged[-1]['label']:
@@ -59,58 +51,58 @@ def smooth_chords(chords, min_duration=0.3):
     return merged
 
 
-def normalize_chord_label(label):
-    """CREMA 레이블 → 간결한 코드명 변환
-    예: C:maj → C, A:min → Am, N → N
-    """
-    if label in ('N', 'X'):
-        return label
-    if ':' not in label:
-        return label
+def run_chord_engine(audio_path, hop_length=512):
+    """크로마그램 기반 경량 코드 인식"""
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
 
-    root, quality = label.split('/', 1)[0].split(':', 1)
+    # 크로마그램 추출
+    chroma = librosa.feature.chroma_cqt(
+        y=y, sr=sr, hop_length=hop_length,
+        bins_per_octave=24
+    )  # shape: (12, frames)
 
-    quality_map = {
-        'maj':  '',    # C:maj → C
-        'min':  'm',   # A:min → Am
-        'maj7': 'maj7',
-        'min7': 'm7',
-        '7':    '7',
-        'dim':  'dim',
-        'aug':  'aug',
-        'sus2': 'sus2',
-        'sus4': 'sus4',
-        'hdim7':'m7b5',
-    }
-    q = quality_map.get(quality, quality)
-    return f'{root}{q}'
+    fps = sr / hop_length
+    n_frames = chroma.shape[1]
 
+    # 각 프레임별 코드 판별
+    chord_seq = []
+    for f in range(n_frames):
+        frame = chroma[:, f]
+        norm = np.linalg.norm(frame)
+        if norm < 0.1:
+            chord_seq.append('N')
+            continue
+        frame = frame / norm
 
-def run_crema_engine(audio_path):
-    """CREMA 엔진으로 코드 분석 → [(start, end, label), ...]"""
-    if CREMA_MODEL is None:
-        raise RuntimeError('CREMA 엔진 사용 불가')
+        best_chord = 'N'
+        best_score = 0.3  # 최소 임계값
+        for name, tmpl in CHORD_TEMPLATES.items():
+            if name == 'N': continue
+            score = float(np.dot(frame, tmpl))
+            if score > best_score:
+                best_score = score
+                best_chord = name
 
-    jam = CREMA_MODEL(filename=audio_path)
-    ann = jam.annotations['chord'][0]
+        chord_seq.append(best_chord)
 
+    # 연속 동일 코드 병합 → (start, end, label)
     results = []
-    for obs in ann.data:
-        start = obs.time.total_seconds()
-        end   = start + obs.duration.total_seconds()
-        label = normalize_chord_label(obs.value)
-        results.append((start, end, label))
-
+    prev = chord_seq[0]
+    start_f = 0
+    for f, c in enumerate(chord_seq[1:], 1):
+        if c != prev:
+            results.append((start_f / fps, f / fps, prev))
+            prev = c
+            start_f = f
+    results.append((start_f / fps, n_frames / fps, prev))
     return results
 
 
 def snap_to_grid(chords, bpm, grid_offset_sec):
-    """코드(초)를 0.5박 단위 차체(그리드)에 안착"""
     beat_sec      = 60.0 / bpm
     half_beat_sec = beat_sec / 2.0
     bar_sec       = beat_sec * 4
     result        = []
-
     for (cs, ce, cl) in chords:
         rel_s     = cs - grid_offset_sec
         rel_e     = ce - grid_offset_sec
@@ -118,40 +110,23 @@ def snap_to_grid(chords, bpm, grid_offset_sec):
         snapped_e = round(rel_e / half_beat_sec) * half_beat_sec
         if snapped_e <= snapped_s:
             snapped_e = snapped_s + half_beat_sec
-
         bar  = int(snapped_s / bar_sec) + 1
         beat = round(((snapped_s % bar_sec) / beat_sec + 1) * 2) / 2
-
         result.append({
             'start': round(grid_offset_sec + snapped_s, 3),
             'end':   round(grid_offset_sec + snapped_e, 3),
-            'label': cl,
-            'bar':   bar,
-            'beat':  beat
+            'label': cl, 'bar': bar, 'beat': beat
         })
-
     return result
 
 
-# ── 엔드포인트 ──
-
 @app.route('/ping', methods=['GET'])
 def ping():
-    return jsonify({
-        'status': 'ok',
-        'engine': 'CREMA' if CREMA_MODEL else 'unavailable'
-    })
+    return jsonify({'status': 'ok', 'engine': 'chroma'})
 
 
 @app.route('/analyze_grid', methods=['POST'])
 def analyze_grid():
-    """
-    파이프라인:
-    1. 오디오 + BPM + gridOffset 수신
-    2. CREMA 엔진 분석
-    3. Smooth (Logic 스타일)
-    4. 차체(그리드) 안착 → 반환
-    """
     if 'audio' not in request.files:
         return jsonify({'error': 'audio file required'}), 400
 
@@ -163,27 +138,22 @@ def analyze_grid():
 
     suffix   = os.path.splitext(f.filename)[1] or '.mp3'
     tmp_path = None
-
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             f.save(tmp.name)
             tmp_path = tmp.name
 
-        # CREMA 엔진
-        raw_chords = run_crema_engine(tmp_path)
-        print(f'[CREMA] {len(raw_chords)}개 감지')
+        raw_chords = run_chord_engine(tmp_path)
+        print(f'[엔진] {len(raw_chords)}개 감지')
 
-        # Smooth (Logic 스타일)
         raw_list = [{'start': s, 'end': e, 'label': l} for s, e, l in raw_chords]
-        smoothed = smooth_chords(raw_list, min_duration=0.3)
+        smoothed = smooth_chords(raw_list, min_duration=0.5)
 
-        # 차체(그리드) 안착
-        tuples   = [(c['start'], c['end'], c['label']) for c in smoothed]
-        snapped  = snap_to_grid(tuples, bpm, grid_offset_sec)
-        flat     = [{'start': s['start'], 'end': s['end'], 'label': s['label']} for s in snapped]
+        tuples     = [(c['start'], c['end'], c['label']) for c in smoothed]
+        snapped    = snap_to_grid(tuples, bpm, grid_offset_sec)
+        flat       = [{'start': s['start'], 'end': s['end'], 'label': s['label']} for s in snapped]
         compressed = compress_chords(flat)
 
-        # 마디/박자 재계산
         beat_sec = 60.0 / bpm
         bar_sec  = beat_sec * 4
         result   = []
