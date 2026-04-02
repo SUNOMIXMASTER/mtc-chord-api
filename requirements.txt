@@ -11,3 +11,6 @@ jams>=0.3.4
 numpy>=1.19.2
 pumpp>=0.5.0
 scikit_learn>=0.23.2
+flask
+flask-cors
+gunicorn
