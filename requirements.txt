@@ -3,7 +3,8 @@ flask-cors
 crema
 jams
 librosa
-tensorflow
+tensorflow==2.13.0
+keras==2.13.0
 numpy
 scipy
 gunicorn
